@@ -1,250 +1,429 @@
 # AttributeSync Guide
 
-Oct 12, 2026 · @Warzone
+**Oct 12, 2026 · @Warzone**
 
 ## Overview
 
-AttributeSync lets you read and write an Instance's attributes like normal properties (`boss.Health -= 25`), with types, defaults and validation checked for you.
+AttributeSync lets you read and write an Instance's attributes like normal properties (`boss.Health -= 25`), with typed schemas, defaults, and validation.
 
-Roblox attributes are untyped, have no defaults, and a typo in a name fails silently. AttributeSync fixes that with a small schema you write once.
+Roblox attributes do not enforce your schema, provide schema defaults, or prevent misspelled attribute names. AttributeSync adds those conveniences while keeping the actual data stored on the Instance.
 
-- **Auto typing:** the schema is just your defaults table, so Luau knows `data.Health` is a number when reading and writing.
-- **Validated writes:** wrong types, bad enum values, `NaN` and unknown keys all error instead of corrupting data. Numbers can be clamped to a range.
-- **Shared wrappers:** every script that wraps the same Instance gets the same wrapper, and new schema keys merge in.
-- **Lightweight:** one small table per wrapped Instance, one shared metatable, no polling and no connections unless you ask for them.
-- **No leaks:** weak tables mean a wrapper is collected once nothing references it. The real data always lives in the attributes themselves.
+- **Auto typing:** Define a schema using a defaults table. Luau infers the types of your wrapper's fields.
+- **Validated writes:** Reject wrong types, `NaN`, invalid enum values, and unknown schema keys. Numbers can be clamped to a range.
+- **Shared wrappers:** Calls to `new` for the same Instance reuse the wrapper and can merge additional schema keys.
+- **Change notifications:** Subscribe to attribute changes using `Observe` or `GetChangedSignal`.
+- **Bulk operations:** Update multiple attributes atomically with respect to validation, reset values, and serialize snapshots.
+- **Tag binding:** Automatically wrap existing and newly tagged Instances.
+- **Memory-conscious design:** Weak references allow unused wrappers to be collected when nothing else retains them. Actual attribute data remains on the Instance.
+- **Compiler directives:** The module uses `--!native` and `--!optimize 2` to request native code generation and level-2 optimization where supported.
+
+AttributeSync is intended to be lightweight, but actual performance and memory usage depend on the workload and Roblox runtime.
 
 ## Getting started
 
-Put the module in `ReplicatedStorage` (for example `ReplicatedStorage.Shared.Packages.AttributeSync`) and require it from any script.
+Place the module somewhere accessible to the scripts that need it, such as `ReplicatedStorage.Shared.Packages.AttributeSync`.
 
 ```luau
-local AttributeSync = require(game:GetService("ReplicatedStorage").Shared.Packages.AttributeSync)
+local AttributeSync = require(
+    game:GetService("ReplicatedStorage")
+        .Shared.Packages.AttributeSync
+)
 
 local boss = workspace.Boss
 
 local data = AttributeSync.new(boss, {
-	Name = "Boss",
-	Health = AttributeSync.field(500, { min = 0, max = 500 }),
-	State = AttributeSync.field("Idle", { oneOf = { "Idle", "Chasing", "Dead" } }),
-	Enraged = false,
+    Name = "Boss",
+    Health = AttributeSync.field(500, { min = 0, max = 500 }),
+    State = AttributeSync.field("Idle", {
+        oneOf = { "Idle", "Chasing", "Dead" },
+    }),
+    Enraged = false,
 })
 
-data.Health -= 25          -- number, clamped to 0..500
-data.State = "Chasing"     -- must be an allowed value
-print(data.Name)           -- "Boss"
+data.Health -= 25
+data.State = "Chasing"
+
+print(data.Name) -- "Boss"
 ```
 
-The first call creates any attribute that doesn't exist yet, using its default. Attributes that already exist keep their current value.
-
-Place the module where every script that needs it can reach it. Server-only code can keep it in `ServerScriptService`.
+The first call initializes missing attributes using their defaults. Existing attributes are retained, subject to the module's registration and initialization rules.
 
 ## Defining a schema
 
-A schema is a table of `name = default`. The default decides the key's type, so every default must be non-nil.
+A schema is a table of `name = default`. Each default determines the corresponding field's type and must be non-`nil`.
 
 ```luau
 local data = AttributeSync.new(part, {
-	Coins = 0,                       -- number
-	Owner = "",                      -- string
-	Locked = false,                  -- boolean
-	Spawn = Vector3.new(0, 10, 0),   -- Vector3
-	Tint = Color3.new(1, 1, 1),      -- Color3
+    Coins = 0,
+    Owner = "",
+    Locked = false,
+    Spawn = Vector3.new(0, 10, 0),
+    Tint = Color3.new(1, 1, 1),
 })
 ```
 
-The return type is the same as the table you pass in, which is why `data.Coins` is typed as a number and `data.Locked = "yes"` is flagged by the type checker.
+AttributeSync supports Roblox attribute-compatible values, including strings, numbers, booleans, `Vector3`, `Color3`, `CFrame`, `UDim2`, `BrickColor`, `NumberRange`, and other supported attribute types. Instance references, tables, and functions cannot be stored directly as attributes.
 
-Any type Roblox allows as an attribute works, including `string`, `number`, `boolean`, `Vector3`, `Color3`, `CFrame`, `UDim2`, `BrickColor` and `NumberRange`. Instance references are not supported by attributes. Store an `ObjectValue` or an id instead.
-
-You can pass a third argument of starting values. They apply only to attributes that don't exist yet, and they must match the key's type.
+You can provide a third argument containing initial values. These values apply only when the corresponding attribute does not already exist, and they must match the schema's type.
 
 ```luau
-local data = AttributeSync.new(part, { Owner = "" }, { Owner = player.Name })
+local data = AttributeSync.new(
+    part,
+    { Owner = "" },
+    { Owner = player.Name }
+)
 ```
 
-Attribute names must be alphanumeric or underscores, under 100 characters, and must not start with `RBX`.
+Attribute names must be alphanumeric or underscores, fewer than 100 characters, and must not start with `RBX`.
 
 ## Fields: constraints on a key
 
-Wrap a default in `AttributeSync.field(default, options)` to add rules. The result is still typed as the default's type, so auto typing keeps working.
+Use `AttributeSync.field(default, options)` to add validation rules while retaining the default's inferred type.
 
-| Option | Applies to | What it does |
+| Option | Applies to | Behavior |
 | --- | --- | --- |
-| `min` | numbers | Values below it are raised to `min` (clamped) |
-| `max` | numbers | Values above it are lowered to `max` (clamped) |
-| `oneOf` | any type | Only values in the list are accepted, otherwise an error |
-| `validate` | any type | A function returning `true` to accept, otherwise an error |
+| `min` | Numbers | Clamps values below the minimum. |
+| `max` | Numbers | Clamps values above the maximum. |
+| `oneOf` | Any supported type | Accepts only values included in the allowed list. |
+| `validate` | Any supported type | Calls a function that must return `true` to accept the value. |
 
 ```luau
 local data = AttributeSync.new(npc, {
-	Health = AttributeSync.field(100, { min = 0, max = 100 }),
-	State = AttributeSync.field("Idle", { oneOf = { "Idle", "Chasing", "Dead" } }),
-	Level = AttributeSync.field(1, {
-		validate = function(level: number)
-			return level % 1 == 0 -- whole numbers only
-		end,
-	}),
+    Health = AttributeSync.field(100, { min = 0, max = 100 }),
+
+    State = AttributeSync.field("Idle", {
+        oneOf = { "Idle", "Chasing", "Dead" },
+    }),
+
+    Level = AttributeSync.field(1, {
+        validate = function(level: number)
+            return level % 1 == 0
+        end,
+    }),
 })
 
-data.Health = 150   -- stored as 100
-data.Health = -20   -- stored as 0
-data.State = "Flying"  -- error: not an allowed value
-data.Level = 1.5       -- error: failed validation
+data.Health = 150       -- Stored as 100.
+data.Health = -20       -- Stored as 0.
+data.State = "Flying"   -- Errors; value is unchanged.
+data.Level = 1.5        -- Errors; validation fails.
 ```
 
-The default itself must pass its own rules. A default of `500` with `max = 10` errors when you call `new`, and nothing is written.
+The default must satisfy its own constraints. For example, a default of `500` with `max = 10` is invalid and causes registration to fail.
 
-## Reading, writing and sharing across scripts
+## Reading, writing, and sharing
 
-Use the wrapper like a table. Reads return the live attribute, and writes go straight to the Instance after validation.
+Wrappers behave like tables:
 
 ```luau
-print(data.Health)       -- reads the attribute
-data.Health += 10        -- validates, clamps, then writes it
+print(data.Health)
+data.Health += 10
 data.Enraged = true
 ```
 
-If something else clears an attribute (for example `instance:SetAttribute("Health", nil)`), reading it returns the schema default instead of `nil`.
+Reads access the underlying attribute. Writes pass through the wrapper's validation and constraint handling before being stored.
 
-Every call to `AttributeSync.new` for the same Instance returns the same wrapper, from any script. If a later call includes extra keys, they are merged in. Keys that are already registered are never changed, so a second script can't override the first script's defaults.
+If an attribute is removed externally, a subsequent wrapper read returns the schema default instead of `nil`.
+
+```luau
+boss:SetAttribute("Health", nil)
+
+print(data.Health) -- Schema default, if the attribute is missing.
+```
+
+**Important:** Values written directly through `Instance:SetAttribute()` are not validated by AttributeSync. An external script can write a value of the wrong type, and a wrapper read can return that invalid value. Use the wrapper consistently when validation is required.
+
+### Shared wrapper behavior
+
+Calls to `AttributeSync.new` for the same Instance reuse the registered wrapper while it remains available. Additional schema keys can be merged into it. Existing registered keys retain their original registration and are not overridden by later defaults.
 
 ```luau
 -- Script A
-local data = AttributeSync.new(workspace.Boss, { Health = 500, Enraged = false })
-data.Health -= 25
+local dataA = AttributeSync.new(workspace.Boss, {
+    Health = 500,
+    Enraged = false,
+})
 
--- Script B: same wrapper, same attributes, plus a new key
-local data = AttributeSync.new(workspace.Boss, { Health = 999, Phase = 1 })
-print(data.Health)  -- 475 (the 999 is ignored, Health is already registered)
-print(data.Phase)   -- 1
+dataA.Health -= 25
+
+-- Script B
+local dataB = AttributeSync.new(workspace.Boss, {
+    Health = 999,
+    Phase = 1,
+})
+
+print(dataB.Health) -- 475; the registered Health schema is retained.
+print(dataB.Phase)  -- 1
 ```
 
-Keep a reference to the wrapper while you use it. If nothing holds it, it can be garbage collected, but calling `new` again simply rebuilds it from the attributes.
+Keep a reference to the wrapper while you need it. If it becomes unreachable, it may be garbage-collected. A subsequent `new` call can construct another wrapper from the Instance's current attributes.
 
 ## Reacting to changes
 
-Use `Observe` when you want the current value plus every future change. Use `GetChangedSignal` when you only want a plain signal.
+### Observe
 
-`Observe(wrapper, key, callback)` calls your function right away with `(current, nil)`, then with `(new, old)` each time the value changes. It returns a connection, so disconnect it when you're done.
+`Observe(wrapper, key, callback)` immediately invokes the callback with the current value and `nil` as the previous value. It then invokes the callback for subsequent observed changes with `(new, old)`.
 
 ```luau
-local connection = AttributeSync.Observe(data, "Health", function(new, old)
-	if old == nil then
-		print("starting health:", new)
-	else
-		print(`health {old} -> {new}`)
-	end
+local connection = AttributeSync.Observe(
+    data,
+    "Health",
+    function(new, old)
+        if old == nil then
+            print("Starting health:", new)
+        else
+            print(`Health {old} -> {new}`)
+        end
 
-	if new <= 0 then
-		data.State = "Dead"
-	end
-end)
+        if new <= 0 then
+            data.State = "Dead"
+        end
+    end
+)
 
--- later
+-- Disconnect when no longer needed.
 connection:Disconnect()
 ```
 
-`GetChangedSignal(wrapper, key)` returns Roblox's `GetAttributeChangedSignal` for that key. It fires for changes made by any script, including ones that bypass the wrapper.
+The callback should be a function. Validate callback arguments before registering observers if your code accepts untrusted inputs.
+
+### GetChangedSignal
+
+`GetChangedSignal(wrapper, key)` returns the Instance's attribute-changed signal for that schema key.
 
 ```luau
 AttributeSync.GetChangedSignal(data, "Enraged"):Connect(function()
-	print("enraged is now", data.Enraged)
+    print("Enraged is now", data.Enraged)
 end)
 ```
 
-Both work for any key in the schema and error on unknown keys. They add one connection each, and only when you call them.
+Unlike `Observe`, this signal does not provide the old and new values as callback arguments. It can fire for changes made outside AttributeSync, including writes that bypass wrapper validation.
+
+Connections are created only when requested. Disconnect connections when they are no longer needed.
 
 ## Bulk operations and tag binding
 
-`Update` sets several keys at once, and it is all or nothing: every value is validated first, so one bad value changes nothing.
+### Update
+
+`Update` validates all supplied values before applying any writes. If validation fails, no fields from that update are applied.
 
 ```luau
-AttributeSync.Update(data, { Health = 250, State = "Chasing" })
+AttributeSync.Update(data, {
+    Health = 250,
+    State = "Chasing",
+})
 ```
 
-`Reset` puts one key, or every key, back to its default.
+### Reset
+
+Restore one field or all registered fields to their defaults.
 
 ```luau
-AttributeSync.Reset(data, "Health")  -- one key
-AttributeSync.Reset(data)            -- every key
+AttributeSync.Reset(data, "Health")
+AttributeSync.Reset(data)
 ```
 
-`ToTable` takes a plain-table snapshot of every schema key, and `FromTable` restores it with the same validation as `Update`. This works well for saving to a DataStore or sending state to another server.
+### ToTable and FromTable
+
+`ToTable` produces a plain-table snapshot. `FromTable` restores values using validation equivalent to `Update`.
 
 ```luau
 local snapshot = AttributeSync.ToTable(data)
--- ...state changes...
+
+-- Change state...
+
 AttributeSync.FromTable(data, snapshot)
 ```
 
-`BindTag` wraps every Instance that has a CollectionService tag, including ones that already exist and ones that appear later (for example streamed in). It returns a function that stops binding new Instances.
+Use these functions when preparing data for a DataStore or another serialization mechanism. Ensure the values are supported by the destination and that any required serialization limits are respected.
+
+**Snapshot behavior:** Diagnostic testing found that `ToTable` can include extra raw attributes beyond the registered schema. If your application requires strictly schema-only snapshots, verify or enforce that behavior before relying on the snapshot as a schema-filtered representation.
+
+### BindTag
+
+`BindTag` wraps Instances carrying a CollectionService tag, including existing Instances and Instances tagged later.
 
 ```luau
-local unbind = AttributeSync.BindTag("Enemy", {
-	Health = AttributeSync.field(100, { min = 0, max = 100 }),
-	State = "Idle",
-}, function(wrapper, instance)
-	print(instance.Name, "is ready with", wrapper.Health, "health")
-end)
+local unbind = AttributeSync.BindTag(
+    "Enemy",
+    {
+        Health = AttributeSync.field(100, {
+            min = 0,
+            max = 100,
+        }),
+        State = "Idle",
+    },
+    function(wrapper, instance)
+        print(instance.Name, "is ready with", wrapper.Health, "health")
+    end
+)
 
--- later, to stop wrapping new tagged Instances
+-- Stop binding newly discovered tagged Instances.
 unbind()
 ```
 
-The optional third argument runs once per Instance as it is bound. Attributes on Instances that were already bound are left as they are when you call `unbind`.
+The callback is optional and runs when an Instance is bound. Unbinding stops future binding; it does not automatically undo the attributes or schema already applied to existing wrappers.
 
-## Errors, gotchas and best practices
+## Errors, edge cases, and best practices
 
-Most mistakes raise a clear error that points at the line that caused it.
-
-| What you did | What happens |
+| Situation | Expected behavior or diagnostic finding |
 | --- | --- |
-| Read or write a key that isn't in the schema | Error: not in the schema |
-| Write the wrong type | Error: expects `number`, got `string` |
-| Write `NaN` | Error: can't be `NaN` |
-| Write a value that fails `oneOf` or `validate` | Error, value unchanged |
-| Write a number outside `min` / `max` | Clamped, no error |
-| Use a `nil` default | Error: needs a non-nil default |
-| Bad default or starting value in `new` | Error, nothing is written or registered |
+| Read or write an unknown wrapper key | Errors because the key is not in the schema. |
+| Write a value of the wrong type through the wrapper | Errors without changing the value. |
+| Write `NaN` | Rejected. |
+| Write a value outside `min` or `max` | Clamped to the allowed range. |
+| Write an invalid `oneOf` value | Rejected. |
+| Fail custom validation | Rejected; the stored value remains unchanged. |
+| Use a `nil` default | Rejected. |
+| Register an invalid default | Registration fails before invalid initialization is applied. |
+| Submit a mixed valid/invalid `Update` | Validation fails before any supplied field is applied. |
+| Remove an attribute externally | Wrapper reads return the schema default. |
+| Write an invalid value directly with `SetAttribute` | The wrapper does not revalidate it on read. |
+| Supply an invalid `Observe` callback | Diagnostic testing found that registration currently succeeds; callers should supply a valid function. |
+| Change the schema table after registration | Diagnostic testing found that later registration can extend the schema; avoid mutating schema definitions unless this behavior is intentional. |
 
-**Good habits**
+### Good habits
 
-- Define the full schema once in a shared module or at the top of your script, and reuse it.
-- Keep the wrapper in a local variable while you use it instead of calling `new` in a hot loop.
-- Disconnect `Observe` connections you no longer need. Connections to an Instance are cleaned up automatically when it is destroyed.
-- Use `pcall` only where you expect bad input, such as values coming from players. Errors elsewhere usually mean a bug you want to see.
+- Define schemas centrally and reuse them.
+- Cache wrappers in local variables instead of repeatedly calling `new` in hot loops.
+- Prefer wrapper writes wherever validation matters.
+- Disconnect observer connections when finished.
+- Use `pcall` around operations where failure is expected, such as handling untrusted input. Avoid hiding unexpected programming errors.
+- Keep snapshots and saved data within the supported serialization format.
+- Treat benchmark results as measurements of a particular runtime, not guaranteed production performance.
 
-**Things to know**
+## Compiler directives
 
-- Attributes changed on the server replicate to clients. Changes made on a client do not replicate back to the server, so treat client writes as local only.
-- The type checker catches wrong-type writes only when it can see the schema. If you cast the wrapper to `any`, only the runtime check remains.
-- Values set outside the module are not re-validated when read. They are checked only when written through the wrapper.
-- Attributes can't hold Instance references, tables or functions.
+The module currently uses:
+
+```luau
+--!native
+--!optimize 2
+```
+
+These directives request native code generation and level-2 optimization. They are intended to improve execution where supported, but their presence alone does not guarantee faster performance.
+
+Benchmark the module with the directives enabled and disabled under the same conditions before attributing a speed difference to them. Roblox API calls, validation work, observer callbacks, runtime state, and garbage collection can all affect results.
+
+## Benchmarks
+
+The following measurements come from the latest diagnostic run. Times are median elapsed milliseconds for the indicated workload; lower is faster.
+
+**Latest run**
+
+| Operation | Workload | Median |
+| --- | --- | ---: |
+| Cached `new()` | 20,000 calls × 3 | 26.54 ms |
+| Raw `SetAttribute` | 50,000 writes × 3 | 81.39 ms |
+| Wrapper plain-number write | Benchmark workload | 100.73 ms |
+| Wrapper clamped-number write | Benchmark workload | 82.20 ms |
+| Wrapper `oneOf` string write | Benchmark workload | 99.47 ms |
+| Wrapper boolean write | Benchmark workload | 86.43 ms |
+| Wrapper write with validator callback | Benchmark workload | 97.93 ms |
+| Wrapper read | 100,000 reads | 34.56 ms |
+| Raw `GetAttribute` | 100,000 reads | 16.53 ms |
+| Changed writes | 10,000 writes | 26.73 ms |
+| Same-value writes | 10,000 writes | 7.83 ms |
+
+The write benchmarks use different operation paths, so do not treat them as perfectly interchangeable comparisons. The wrapper adds schema and validation behavior that raw attribute operations do not provide.
+
+### Previous run comparison
+
+| Benchmark | Previous median | Latest median | Change |
+| --- | ---: | ---: | ---: |
+| Cached `new()` | 23.14 ms | 26.54 ms | +14.7% |
+| Raw `SetAttribute` | 71.74 ms | 81.39 ms | +13.5% |
+| Plain-number write | 87.11 ms | 100.73 ms | +15.6% |
+| Clamped-number write | 69.69 ms | 82.20 ms | +18.0% |
+| `oneOf` string write | 84.35 ms | 99.47 ms | +17.9% |
+| Boolean write | 82.71 ms | 86.43 ms | +4.5% |
+| Validator callback write | 92.36 ms | 97.93 ms | +6.0% |
+| Wrapper read | 23.97 ms | 34.56 ms | +44.2% |
+| Raw `GetAttribute` | 15.57 ms | 16.53 ms | +6.2% |
+
+The latest measurements were slower across these listed operations. This does **not** establish that `--!native` or `--!optimize 2` caused the slowdown: the runs were not a controlled, repeated A/B experiment.
+
+For meaningful comparisons:
+
+1. Run both versions in the same Roblox environment.
+2. Alternate the versions across multiple runs.
+3. Keep the workload, iteration counts, and test data identical.
+4. Compare medians rather than a single measurement.
+5. Test each directive independently and then test both together.
+6. Keep correctness assertions enabled while benchmarking.
+
+### Same-value write optimization
+
+The latest run measured 10,000 same-value writes at **7.83 ms**, compared with **26.73 ms** for changed writes. Same-value writes were approximately **3.42 times faster** in that workload.
+
+This is consistent with avoiding unnecessary work when a value has not changed. Actual results depend on the workload and runtime.
+
+## Memory diagnostics
+
+The latest diagnostic run reported the following Lua heap measurements:
+
+| Checkpoint | Lua heap |
+| --- | ---: |
+| Start | 433 KB |
+| Before scale creation | 681 KB |
+| After scale creation | 13,599 KB |
+| After destroying 1,000 Instances and garbage collection | 5,439 KB |
+| Final cleanup and garbage collection | 3,034 KB |
+
+The heap dropped substantially after cleanup, but the remaining heap is not by itself proof of a memory leak. Garbage collection timing, other retained objects, and runtime activity can affect these measurements. Engine memory measurements were also variable during the run.
+
+A separate churn probe reported 250/250 weak wrapper references remaining in each round. That result is inconclusive without verifying that the test itself does not retain strong references and allowing garbage collection to run under controlled conditions.
+
+To investigate memory retention, use repeated creation/destruction cycles, remove all intentional references, force garbage collection where the test environment permits it, and inspect whether memory consistently grows across comparable cycles.
+
+## Testing
+
+The diagnostic harness exercises registration, reads and writes, validation, wrapper sharing, signals, clamping, snapshots, tag binding, serialization-compatible types, and cleanup behavior.
+
+The latest reported run completed with:
+
+- **19 sections**
+- **180 assertions passed**
+- **0 assertion failures**
+- **0 section crashes**
+- 23 exploratory probes
+- 11 benchmarks
+- 55.43 seconds total runtime
+
+Passing assertions demonstrate that the tested expectations passed; they do not prove the absence of every bug or memory leak. Exploratory probes can also reveal behaviors that deserve separate decisions or additional tests.
+
+### Running the tests
+
+1. Place the module at `ReplicatedStorage.Shared.Packages.AttributeSync`.
+2. Place the diagnostic script in `ServerScriptService` as a regular `Script`.
+3. Run the experience in Studio.
+4. Review the Output window for failures, diagnostic findings, benchmark results, and the final summary.
+
+Use a consistent Studio setup for comparisons. Avoid running unrelated workloads during benchmark measurements.
+
+## Things to know
+
+- Server-side attribute changes replicate to clients. Client-side changes do not replicate back to the server.
+- Static typing depends on Luau being able to infer the schema and wrapper type. Casting to `any` removes those compile-time guarantees.
+- Runtime wrapper validation applies to writes made through AttributeSync, not arbitrary external `SetAttribute` calls.
+- Attributes cannot directly store Instances, tables, or functions.
+- Weak references make unused wrappers eligible for collection; they do not guarantee immediate collection or prove that the entire application is leak-free.
+- Compiler directives can affect execution performance, but benchmark results must be measured on the target workload.
 
 ## API reference
 
 | Function | Returns | Description |
 | --- | --- | --- |
-| `AttributeSync.new(instance, defaults, initial?)` | typed wrapper | Wraps an Instance with a schema. Returns the shared wrapper and merges in new keys. |
-| `AttributeSync.field(default, options?)` | the default's type | Adds `min`, `max`, `oneOf` or `validate` rules to a key. |
-| `AttributeSync.Observe(wrapper, key, callback)` | connection | Calls `callback(current, nil)` now, then `callback(new, old)` on each change. |
-| `AttributeSync.GetChangedSignal(wrapper, key)` | signal | Roblox's attribute-changed signal for a schema key. |
-| `AttributeSync.Update(wrapper, values)` | nothing | Sets several keys, all or nothing. |
-| `AttributeSync.Reset(wrapper, key?)` | nothing | Restores one key, or all keys, to their defaults. |
-| `AttributeSync.ToTable(wrapper)` | table | Plain snapshot of every schema key. |
-| `AttributeSync.FromTable(wrapper, snapshot)` | nothing | Restores a snapshot, validated like `Update`. |
-| `AttributeSync.BindTag(tag, defaults, onBound?)` | function | Wraps every Instance with the tag. Call the returned function to stop binding new ones. |
-| `AttributeSync.GetInstance(wrapper)` | Instance | The Instance a wrapper belongs to. |
+| `AttributeSync.new(instance, defaults, initial?)` | Typed wrapper | Creates or reuses a wrapper and merges additional schema keys. |
+| `AttributeSync.field(default, options?)` | Default's type | Adds validation or clamping rules. |
+| `AttributeSync.Observe(wrapper, key, callback)` | Connection | Calls the callback immediately, then on observed changes. |
+| `AttributeSync.GetChangedSignal(wrapper, key)` | Signal | Returns the Instance's attribute-changed signal for a schema key. |
+| `AttributeSync.Update(wrapper, values)` | Nothing | Validates a group of values before applying writes. |
+| `AttributeSync.Reset(wrapper, key?)` | Nothing | Restores one key or all keys to their defaults. |
+| `AttributeSync.ToTable(wrapper)` | Table | Creates a snapshot of attribute values. |
+| `AttributeSync.FromTable(wrapper, snapshot)` | Nothing | Restores values through validation. |
+| `AttributeSync.BindTag(tag, defaults, onBound?)` | Function | Binds tagged Instances and returns an unbind function. |
+| `AttributeSync.GetInstance(wrapper)` | Instance | Returns the Instance associated with a wrapper. |
 
-## Testing
+---
 
-The included test script runs every feature against `workspace` and prints a pass or fail line for each check.
-
-1. Put the module at `ReplicatedStorage.Shared.Packages.AttributeSync`.
-2. Add `AttributeSyncTests` as a regular `Script` in `ServerScriptService`.
-3. Press Play or Run and watch the Output window.
-
-A passing run ends with a summary line such as `AttributeSync tests finished: 50 passed, 0 failed`. Failed checks print with a warning and a short detail message.
-
-The tests cover defaults and starting values, reads and writes, validation errors, sharing between scripts, change signals, clamping, `oneOf`, `validate`, failed registration, `Observe`, `Reset`, `Update`, snapshots and `BindTag`. All test attributes start with `Test_` and are removed when the run finishes.
+*Benchmark figures are from one diagnostic run and are provided for transparency, not as performance guarantees.*
